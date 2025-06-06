@@ -1,4 +1,5 @@
-"use client";
+"use client";import React from "react";
+
 
 import type { GoodThingItem } from '@/types';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";

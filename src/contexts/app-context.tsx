@@ -1,22 +1,38 @@
+
 "use client";
 
 import type { GoodThingItem } from '@/types';
-import React, { createContext, useContext, useState, ReactNode, useEffect } from 'react';
+import React, { createContext, useContext, useState, ReactNode, useEffect, useCallback } from 'react';
 import useLocalStorage from '@/hooks/use-local-storage';
-import { GOOD_THINGS_DATA, getTodayDateString } from '@/lib/content-data';
+import { getTodayDateString } from '@/lib/content-data'; // Keep for date string utility
 import { summarizeGoodNews } from '@/ai/flows/summarize-good-news';
+import { db } from '@/lib/firebase'; // Import Firestore instance
+import { collection, query, where, getDocs, orderBy, limit, documentId } from 'firebase/firestore';
 
 interface AppContextType {
   favorites: string[];
   toggleFavorite: (itemId: string) => void;
   isFavorite: (itemId: string) => boolean;
-  getFavoriteItems: () => GoodThingItem[];
+  getFavoriteItems: () => Promise<GoodThingItem[]>;
   getTodaysItem: () => Promise<GoodThingItem | null>;
-  getArchivedItems: () => GoodThingItem[];
+  getArchivedItems: () => Promise<GoodThingItem[]>;
   isLoadingTodayItem: boolean;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
+
+// Helper to map Firestore doc to GoodThingItem
+const mapDocToGoodThingItem = (doc: any): GoodThingItem => {
+  const data = doc.data();
+  return {
+    id: doc.id,
+    date: data.date,
+    type: data.type,
+    content: data.content,
+    source: data.source,
+    // isFavorite will be set dynamically
+  };
+};
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [favorites, setFavorites] = useLocalStorage<string[]>('affirmation-oasis-favorites', []);
@@ -31,20 +47,58 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     );
   };
 
-  const isFavorite = (itemId: string) => favorites.includes(itemId);
+  const isFavorite = useCallback((itemId: string) => favorites.includes(itemId), [favorites]);
 
-  const getFavoriteItems = (): GoodThingItem[] => {
-    return GOOD_THINGS_DATA.filter(item => favorites.includes(item.id)).map(item => ({...item, isFavorite: true}));
-  };
+  const getFavoriteItems = useCallback(async (): Promise<GoodThingItem[]> => {
+    if (!favorites.length) return [];
+    setIsLoadingTodayItem(true); // Re-use loading state for simplicity, or add a new one
+    try {
+      const affirmationsCol = collection(db, 'affirmations');
+      // Firestore 'in' query supports up to 30 elements in the array. 
+      // For more, multiple queries would be needed. Assuming favorites list is not excessively long.
+      if (favorites.length > 30) {
+        console.warn("Favorite list is long, fetching in batches might be required for >30 items.");
+      }
+      const q = query(affirmationsCol, where(documentId(), 'in', favorites.slice(0, 30)));
+      const querySnapshot = await getDocs(q);
+      const items = querySnapshot.docs.map(doc => ({
+        ...mapDocToGoodThingItem(doc),
+        isFavorite: true,
+      }));
+      setIsLoadingTodayItem(false);
+      return items;
+    } catch (error) {
+      console.error("Error fetching favorite items from Firestore:", error);
+      setIsLoadingTodayItem(false);
+      return []; // Fallback to empty array on error
+    }
+  }, [favorites, isFavorite]);
   
-  const getArchivedItems = (): GoodThingItem[] => {
-    const today = getTodayDateString();
-    return GOOD_THINGS_DATA.filter(item => item.date < today)
-                           .sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-                           .map(item => ({...item, isFavorite: isFavorite(item.id)}));
-  };
+  const getArchivedItems = useCallback(async (): Promise<GoodThingItem[]> => {
+    setIsLoadingTodayItem(true);
+    const todayStr = getTodayDateString();
+    try {
+      const affirmationsCol = collection(db, 'affirmations');
+      const q = query(
+        affirmationsCol,
+        where('date', '<', todayStr),
+        orderBy('date', 'desc')
+      );
+      const querySnapshot = await getDocs(q);
+      const items = querySnapshot.docs.map(doc => ({
+        ...mapDocToGoodThingItem(doc),
+        isFavorite: isFavorite(doc.id),
+      }));
+      setIsLoadingTodayItem(false);
+      return items;
+    } catch (error) {
+      console.error("Error fetching archived items from Firestore:", error);
+      setIsLoadingTodayItem(false);
+      return [];
+    }
+  }, [isFavorite]);
 
-  const getTodaysItem = async (): Promise<GoodThingItem | null> => {
+  const getTodaysItem = useCallback(async (): Promise<GoodThingItem | null> => {
     const todayStr = getTodayDateString();
 
     if (todaysItemCache && todaysItemCache.date === todayStr) {
@@ -52,34 +106,48 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
     
     setIsLoadingTodayItem(true);
-    let item = GOOD_THINGS_DATA.find(i => i.date === todayStr) || null;
+    let item: GoodThingItem | null = null;
 
-    if (item && item.type === 'news' && item.content.startsWith('http')) {
-      try {
-        const summaryResult = await summarizeGoodNews({ articleUrl: item.content });
-        item = {
-          ...item,
-          content: summaryResult.summary,
-          type: 'ai-news', 
-          source: item.source || "AI Summary", // Keep original source or use AI as source
-        };
-      } catch (error) {
-        console.error("Failed to summarize news:", error);
-        // Fallback to original content or a message
-        item = { ...item, content: "Could not load news summary. View original article.", type: 'news' };
+    try {
+      const affirmationsCol = collection(db, 'affirmations');
+      const q = query(affirmationsCol, where('date', '==', todayStr), limit(1));
+      const querySnapshot = await getDocs(q);
+
+      if (!querySnapshot.empty) {
+        const doc = querySnapshot.docs[0];
+        item = mapDocToGoodThingItem(doc);
+
+        if (item && item.type === 'news' && item.content.startsWith('http')) {
+          try {
+            const summaryResult = await summarizeGoodNews({ articleUrl: item.content });
+            item = {
+              ...item,
+              content: summaryResult.summary,
+              type: 'ai-news', 
+              source: item.source || item.content, // Keep original source (URL) or use AI as source
+            };
+          } catch (summaryError) {
+            console.error("Failed to summarize news:", summaryError);
+            item = { ...item, content: "Could not load news summary. View original article.", type: 'news' };
+          }
+        }
       }
+    } catch (error) {
+      console.error("Error fetching today's item from Firestore:", error);
+      // Optionally, could fallback to local data here if desired
+      // For now, we'll return null on Firestore error to make it clear data source failed
     }
     
     if (item) {
       const itemWithFavoriteStatus = {...item, isFavorite: isFavorite(item.id)};
       setTodaysItemCache(itemWithFavoriteStatus);
-      setIsLoadingTodayItem(false);
-      return itemWithFavoriteStatus;
+    } else {
+      setTodaysItemCache(null); // Clear cache if no item found for today
     }
     
     setIsLoadingTodayItem(false);
-    return null;
-  };
+    return todaysItemCache ? { ...todaysItemCache, isFavorite: isFavorite(todaysItemCache.id) } : null;
+  }, [isFavorite, todaysItemCache]);
 
 
   return (
